@@ -6,12 +6,12 @@ const mongoose = require('mongoose');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// 1. เชื่อมต่อ MongoDB
+// 1. Database Connection
 mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log('✅ Claw Database Ready!'))
-  .catch(err => console.error('❌ MongoDB Error:', err));
+  .then(() => console.log('✅ Claw Intelligence System: Online'))
+  .catch(err => console.error('❌ Connection Error:', err));
 
-// 2. ผังข้อมูล (Schemas)
+// 2. Data Schemas
 const UserSchema = new mongoose.Schema({
   lineId: { type: String, unique: true },
   displayName: { type: String, default: 'เพื่อนใหม่' },
@@ -27,26 +27,23 @@ const TaskSchema = new mongoose.Schema({
 });
 const Task = mongoose.model('Task', TaskSchema);
 
-// 3. ตั้งค่า LINE และ Gemini
+// 3. AI & Line Config
 const lineConfig = {
   channelAccessToken: process.env.LINE_ACCESS_TOKEN,
   channelSecret: process.env.LINE_SECRET,
 };
 const client = new line.Client(lineConfig);
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 
 app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   try {
     const events = req.body.events;
     await Promise.all(events.map(handleEvent));
     res.status(200).send('OK');
-  } catch (error) {
-    res.status(500).end();
-  }
+  } catch (error) { res.status(500).end(); }
 });
 
-// 4. ฟังก์ชันประมวลผลคำสั่ง
 async function handleEvent(event) {
   if (event.type !== 'message' || event.message.type !== 'text') return;
 
@@ -56,60 +53,69 @@ async function handleEvent(event) {
   let user = await User.findOne({ lineId });
   if (!user) { user = new User({ lineId }); await user.save(); }
 
-  // ⚡️ [A] ระบบดึงรายการงาน (List Tasks)
-  const isAskingForTasks = ["งานอะไรบ้าง", "รายการงาน", "ลิสต์งาน", "มีงานไหม"].some(word => userText.includes(word));
-  if (isAskingForTasks) {
-      const tasks = await Task.find({ userId: lineId, status: 'pending' }).sort({ createdAt: 1 });
-      if (tasks.length === 0) {
-          return client.replyMessage(event.replyToken, { type: 'text', text: `ตอนนี้คุณ ${user.displayName} ไม่มีงานค้างเลยครับ!` });
-      }
-      const taskList = tasks.map((t, i) => `📌 ${i + 1}. ${t.task}`).join('\n');
-      return client.replyMessage(event.replyToken, { type: 'text', text: `รายการงานของคุณครับ:\n\n${taskList}\n\n(ถ้าทำเสร็จแล้ว พิมพ์ว่า "ทำเสร็จแล้วข้อ [เลข]" ได้เลยครับ)` });
-  }
-
-  // ⚡️ [B] ระบบปิดงาน (Complete Task)
-  if (userText.includes("ทำเสร็จแล้ว") || userText.includes("ทำแล้ว") || userText.includes("เสร็จแล้ว")) {
-      const tasks = await Task.find({ userId: lineId, status: 'pending' }).sort({ createdAt: 1 });
-      let targetTask = null;
-
-      // พยายามหาเลขข้อจากข้อความ (เช่น "เสร็จแล้วข้อ 1")
-      const match = userText.match(/\d+/);
-      if (match) {
-          const index = parseInt(match[0]) - 1;
-          if (tasks[index]) targetTask = tasks[index];
-      } else if (tasks.length > 0) {
-          // ถ้าไม่ระบุเลข แต่มีงานเดียว ให้เลือกงานนั้นเลย
-          targetTask = tasks[0];
-      }
-
-      if (targetTask) {
-          targetTask.status = 'completed';
-          await targetTask.save();
-          return client.replyMessage(event.replyToken, { type: 'text', text: `ยอดเยี่ยมครับคุณ ${user.displayName}! ผมติ๊กเครื่องหมายเสร็จเรียบร้อยสำหรับงาน: "${targetTask.task}"` });
-      }
-  }
-
-  // ⚡️ [C] ระบบบันทึกงานใหม่
-  if (userText.includes("จดงาน") || userText.includes("ต้องทำ")) {
-      const cleanTask = userText.replace(/จดงานว่า|ต้องทำว่า|จดงาน|ต้องทำ/g, "").trim();
-      if(cleanTask) {
-          const newTask = new Task({ userId: lineId, task: cleanTask });
-          await newTask.save();
-      }
-  }
-
-  // 🤖 [D] ให้ AI ตอบโต้ทั่วไป
   try {
-    const systemPrompt = `คุณคือ Claw Personal OS ของคุณ ${user.displayName}
-    หน้าที่: เป็นเลขาส่วนตัวที่ช่วยบันทึกและจัดการงาน
-    ข้อความจากผู้ใช้: "${userText}"`;
+    // 🧠 ส่วนที่สำคัญที่สุด: ให้ AI วิเคราะห์เจตนา (Intent Extraction)
+    const analysisPrompt = `คุณคือสมองส่วนกลางของ Claw OS
+    จงวิเคราะห์ประโยค: "${userText}" 
+    แล้วตอบกลับเป็นรูปแบบ JSON เท่านั้น ห้ามตอบเป็นคำบรรยาย:
+    {
+      "intent": "add_task" | "list_tasks" | "complete_task" | "chat",
+      "data": "เนื้อหางานที่ต้องการบันทึก (ถ้ามี)",
+      "taskIndex": "เลขข้อที่ต้องการปิด (ถ้ามี)",
+      "aiReply": "คำตอบที่สุภาพและเป็นกันเองในฐานะเลขา"
+    }
+    
+    กฎ:
+    - ถ้าผู้ใช้บอกเล่าเหตุการณ์ที่ต้องทำในอนาคต = add_task
+    - ถ้าผู้ใช้ขอดูรายการงานหรือถามว่ามีอะไรต้องทำบ้าง = list_tasks
+    - ถ้าผู้ใช้บอกว่าทำอะไรเสร็จแล้ว หรือให้ลบงาน = complete_task
+    - นอกนั้น = chat`;
 
-    const result = await model.generateContent(systemPrompt);
-    const aiResponse = result.response.text();
+    const analysisResult = await model.generateContent(analysisPrompt);
+    const analysis = JSON.parse(analysisResult.response.text().replace(/```json|```/g, ""));
 
-    return client.replyMessage(event.replyToken, { type: 'text', text: aiResponse });
+    // ⚡️ Execution Logic ตามผลวิเคราะห์ของ AI
+    
+    // 1. เพิ่มงานใหม่ (Natural Language Add)
+    if (analysis.intent === "add_task" && analysis.data) {
+        const newTask = new Task({ userId: lineId, task: analysis.data });
+        await newTask.save();
+    }
+
+    // 2. แสดงรายการงาน (Smart List)
+    if (analysis.intent === "list_tasks") {
+        const tasks = await Task.find({ userId: lineId, status: 'pending' }).sort({ createdAt: 1 });
+        if (tasks.length === 0) {
+            return client.replyMessage(event.replyToken, { type: 'text', text: `คุณ ${user.displayName} ไม่มีงานค้างเลยครับ วันนี้ยอดเยี่ยมมาก!` });
+        }
+        const taskList = tasks.map((t, i) => `📌 ${i + 1}. ${t.task}`).join('\n');
+        return client.replyMessage(event.replyToken, { type: 'text', text: `รายการงานของคุณครับ:\n\n${taskList}\n\n${analysis.aiReply}` });
+    }
+
+    // 3. ปิดงาน (Natural Language Complete)
+    if (analysis.intent === "complete_task") {
+        const tasks = await Task.find({ userId: lineId, status: 'pending' }).sort({ createdAt: 1 });
+        let target = null;
+        
+        if (analysis.taskIndex) {
+            target = tasks[parseInt(analysis.taskIndex) - 1];
+        } else {
+            // ค้นหางานที่ข้อความตรงกันที่สุด
+            target = tasks.find(t => userText.includes(t.task.substring(0, 5)));
+        }
+
+        if (target) {
+            target.status = 'completed';
+            await target.save();
+        }
+    }
+
+    // 4. ตอบกลับด้วย AI
+    return client.replyMessage(event.replyToken, { type: 'text', text: analysis.aiReply });
+
   } catch (error) {
-    return client.replyMessage(event.replyToken, { type: 'text', text: 'มึนหัวจังครับ ขอลองใหม่อีกที' });
+    console.error(error);
+    return client.replyMessage(event.replyToken, { type: 'text', text: "ขออภัยครับ สมองส่วนหน้าของผมขัดข้องนิดหน่อย" });
   }
 }
 
