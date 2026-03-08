@@ -6,12 +6,12 @@ const mongoose = require('mongoose');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// 1. เชื่อมต่อสมุดจด (MongoDB) โดยใช้กุญแจ MONGODB_URI จาก Render
+// 1. เชื่อมต่อ MongoDB Atlas (ความจำถาวร)
 mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log('✅ Claw เชื่อมต่อฐานข้อมูลความจำสำเร็จ!'))
-  .catch(err => console.error('❌ ความจำมีปัญหา:', err));
+  .then(() => console.log('✅ Claw Memory & Database Connected!'))
+  .catch(err => console.error('❌ Connection Error:', err));
 
-// 2. ออกแบบโครงสร้างการเก็บข้อมูลผู้ใช้ (Schema)
+// 2. ออกแบบผังข้อมูล (Schemas)
 const UserSchema = new mongoose.Schema({
   lineId: { type: String, unique: true },
   displayName: { type: String, default: 'เพื่อนใหม่' },
@@ -20,7 +20,23 @@ const UserSchema = new mongoose.Schema({
 });
 const User = mongoose.model('User', UserSchema);
 
-// 3. ตั้งค่า LINE และ Gemini
+const TaskSchema = new mongoose.Schema({
+  userId: String,
+  task: String,
+  status: { type: String, default: 'pending' },
+  createdAt: { type: Date, default: Date.now }
+});
+const Task = mongoose.model('Task', TaskSchema);
+
+const NoteSchema = new mongoose.Schema({
+  userId: String,
+  content: String,
+  category: { type: String, default: 'general' },
+  createdAt: { type: Date, default: Date.now }
+});
+const Note = mongoose.model('Note', NoteSchema);
+
+// 3. ตั้งค่า LINE และ Gemini API
 const lineConfig = {
   channelAccessToken: process.env.LINE_ACCESS_TOKEN,
   channelSecret: process.env.LINE_SECRET,
@@ -29,77 +45,87 @@ const client = new line.Client(lineConfig);
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
-// 4. Webhook สำหรับรับข้อความจาก LINE
+// 4. Webhook สำหรับรับข้อความ
 app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   try {
     const events = req.body.events;
     await Promise.all(events.map(handleEvent));
     res.status(200).send('OK');
   } catch (error) {
-    console.error("Webhook Error:", error);
     res.status(500).end();
   }
 });
 
-// 5. ฟังก์ชันหลักในการคิดและจำ
+// 5. ฟังก์ชันหลัก (สมองเลขา)
 async function handleEvent(event) {
   if (event.type !== 'message' || event.message.type !== 'text') return;
 
   const lineId = event.source.userId;
   const userText = event.message.text;
 
-  // ค้นหาข้อมูลผู้ใช้จากฐานข้อมูล
+  // ดึงข้อมูลผู้ใช้
   let user = await User.findOne({ lineId });
   if (!user) {
     user = new User({ lineId });
     await user.save();
   }
 
-  // ✨ ระบบตรวจจับการสั่งจำชื่อ (Manual Override)
-  const nameTriggers = ["ชื่อ", "จำว่า"];
-  if (nameTriggers.some(word => userText.includes(word)) && (userText.includes("ฉัน") || userText.includes("ผม"))) {
+  // --- ระบบตรวจจับคำสั่ง (Logic) ---
+  
+  // A. สั่งจำชื่อ
+  if (userText.includes("ชื่อ") && (userText.includes("ฉัน") || userText.includes("ผม"))) {
       const detectedName = userText.replace(/จำว่า|ฉันชื่อ|ผมชื่อ|คือชื่อของฉัน|คือชื่อของผม/g, "").trim();
-      if (detectedName && detectedName.length < 20) {
+      if (detectedName) {
           user.displayName = detectedName;
           user.memories = `ผู้ใช้คนนี้ชื่อ ${detectedName}`;
           await user.save();
-          return client.replyMessage(event.replyToken, { 
-              type: 'text', 
-              text: `รับทราบครับคุณ ${detectedName}! ผมบันทึกชื่อคุณลงฐานข้อมูลถาวรเรียบร้อยแล้ว คราวหน้าถามผมได้เลยว่าคุณชื่ออะไร 😊` 
-          });
+          return client.replyMessage(event.replyToken, { type: 'text', text: `รับทราบครับคุณ ${detectedName}! บันทึกชื่อเรียบร้อยครับ` });
       }
   }
 
-  try {
-    // ส่งข้อมูลความจำ (Context) ไปให้ AI เพื่อให้มันรู้จักเรา
-    const prompt = `คุณคือ Claw Personal OS ผู้ช่วยส่วนตัวที่ฉลาดและเป็นกันเอง
-    ข้อมูลที่คุณจำได้เกี่ยวกับผู้ใช้คนนี้: ${user.memories}
-    ชื่อของผู้ใช้ที่บันทึกไว้: ${user.displayName}
-    
-    คำถามหรือข้อความจากผู้ใช้: "${userText}"
-    
-    (คำแนะนำ: ถ้าเขาสั่งให้คุณจำอะไรเพิ่มเติม ให้คุณตอบรับและบอกเขาว่าคุณจะบันทึกไว้ในระบบความจำ)`;
+  // B. ดูรายการงาน (Task List)
+  if (userText.includes("รายการงาน") || userText.includes("มีงานอะไรบ้าง") || userText.includes("ลิสต์งาน")) {
+      const tasks = await Task.find({ userId: lineId, status: 'pending' });
+      if (tasks.length === 0) {
+          return client.replyMessage(event.replyToken, { type: 'text', text: "ตอนนี้ยังไม่มีงานค้างครับ สบายใจได้!" });
+      }
+      const taskList = tasks.map((t, i) => `${i + 1}. ${t.task}`).join('\n');
+      return client.replyMessage(event.replyToken, { type: 'text', text: `รายการงานของคุณครับ:\n${taskList}` });
+  }
 
-    const result = await model.generateContent(prompt);
+  // --- การประมวลผลด้วย AI ---
+  try {
+    const systemPrompt = `คุณคือ Claw Personal OS เลขาส่วนตัวของคุณ ${user.displayName}
+    ข้อมูลที่คุณจำได้เกี่ยวกับเขา: ${user.memories}
+    
+    หน้าที่ปัจจุบัน:
+    - ถ้าเขาสั่งงาน (เช่น "จดงานว่า...", "ต้องทำ...") ให้ตอบรับสั้นๆ ว่าบันทึกงานแล้ว
+    - ถ้าให้จดบันทึก (เช่น "บันทึกว่า...", "โน้ตว่า...") ให้ตอบรับว่าบันทึกโน้ตแล้ว
+    - ถ้าคุยเล่นทั่วไป ให้ตอบอย่างเป็นกันเองและชาญฉลาด
+    
+    ข้อความจากผู้ใช้: "${userText}"`;
+
+    const result = await model.generateContent(systemPrompt);
     const aiResponse = result.response.text();
 
-    // อัปเดตเวลาที่คุยล่าสุด
+    // ⚡️ บันทึกลง Database ตามคำสั่ง
+    if (userText.includes("จดงาน") || userText.includes("ต้องทำ")) {
+        const newTask = new Task({ userId: lineId, task: userText.replace(/จดงานว่า|ต้องทำ|จดงาน/g, "").trim() });
+        await newTask.save();
+    } else if (userText.includes("บันทึกว่า") || userText.includes("โน้ตว่า")) {
+        const newNote = new Note({ userId: lineId, content: userText.replace(/บันทึกว่า|โน้ตว่า/g, "").trim() });
+        await newNote.save();
+    }
+
     user.lastChat = new Date();
     await user.save();
 
-    return client.replyMessage(event.replyToken, {
-      type: 'text',
-      text: aiResponse
-    });
+    return client.replyMessage(event.replyToken, { type: 'text', text: aiResponse });
   } catch (error) {
-    console.error("Gemini Error:", error);
-    return client.replyMessage(event.replyToken, {
-      type: 'text',
-      text: 'ขออภัยครับ สมองส่วนประมวลผลขัดข้องนิดหน่อย ลองพิมพ์อีกครั้งได้ไหมครับ?'
-    });
+    return client.replyMessage(event.replyToken, { type: 'text', text: 'ขออภัยครับ ระบบประมวลผลขัดข้อง' });
   }
 }
 
 app.listen(port, () => {
-  console.log(`🚀 Claw OS Phase 2 รันอยู่ที่พอร์ต ${port}`);
+  console.log(`🚀 Claw OS Phase 3 (Secretary) Live on port ${port}`);
 });
