@@ -6,17 +6,16 @@ const mongoose = require('mongoose');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// 1. เชื่อมต่อฐานข้อมูล
+// 1. เชื่อมต่อ MongoDB
 mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log('✅ Claw Connected to MongoDB'))
-  .catch(err => console.error('❌ MongoDB Connection Error:', err));
+  .then(() => console.log('✅ Claw Database Ready!'))
+  .catch(err => console.error('❌ MongoDB Error:', err));
 
-// 2. ออกแบบผังข้อมูล
+// 2. ผังข้อมูล (Schemas)
 const UserSchema = new mongoose.Schema({
   lineId: { type: String, unique: true },
   displayName: { type: String, default: 'เพื่อนใหม่' },
-  memories: { type: String, default: 'ยังไม่มีข้อมูลส่วนตัว' },
-  lastChat: { type: Date, default: Date.now }
+  memories: { type: String, default: 'ยังไม่มีข้อมูลส่วนตัว' }
 });
 const User = mongoose.model('User', UserSchema);
 
@@ -27,13 +26,6 @@ const TaskSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 });
 const Task = mongoose.model('Task', TaskSchema);
-
-const NoteSchema = new mongoose.Schema({
-  userId: String,
-  content: String,
-  createdAt: { type: Date, default: Date.now }
-});
-const Note = mongoose.model('Note', NoteSchema);
 
 // 3. ตั้งค่า LINE และ Gemini
 const lineConfig = {
@@ -54,7 +46,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   }
 });
 
-// 4. ฟังก์ชันหลักในการประมวลผล
+// 4. ฟังก์ชันประมวลผลคำสั่ง
 async function handleEvent(event) {
   if (event.type !== 'message' || event.message.type !== 'text') return;
 
@@ -64,55 +56,60 @@ async function handleEvent(event) {
   let user = await User.findOne({ lineId });
   if (!user) { user = new User({ lineId }); await user.save(); }
 
-  // ⚡️ ส่วนที่ 1: ระบบจัดการคำสั่งโดยตรง (Hard Logic)
-  
-  // ตรวจจับคำสั่งขอดูรายการงาน (เพิ่มคีย์เวิร์ดให้แม่นขึ้น)
-  const isAskingForTasks = ["งานอะไรบ้าง", "รายการงาน", "ลิสต์งาน", "ตารางงาน", "มีงานไหม"].some(word => userText.includes(word));
-  
+  // ⚡️ [A] ระบบดึงรายการงาน (List Tasks)
+  const isAskingForTasks = ["งานอะไรบ้าง", "รายการงาน", "ลิสต์งาน", "มีงานไหม"].some(word => userText.includes(word));
   if (isAskingForTasks) {
-      const tasks = await Task.find({ userId: lineId, status: 'pending' }).sort({ createdAt: -1 });
+      const tasks = await Task.find({ userId: lineId, status: 'pending' }).sort({ createdAt: 1 });
       if (tasks.length === 0) {
-          return client.replyMessage(event.replyToken, { type: 'text', text: `ตอนนี้คุณ ${user.displayName} ยังไม่มีรายการงานค้างครับ!` });
+          return client.replyMessage(event.replyToken, { type: 'text', text: `ตอนนี้คุณ ${user.displayName} ไม่มีงานค้างเลยครับ!` });
       }
       const taskList = tasks.map((t, i) => `📌 ${i + 1}. ${t.task}`).join('\n');
-      return client.replyMessage(event.replyToken, { type: 'text', text: `รายการงานที่บันทึกไว้ครับ:\n\n${taskList}` });
+      return client.replyMessage(event.replyToken, { type: 'text', text: `รายการงานของคุณครับ:\n\n${taskList}\n\n(ถ้าทำเสร็จแล้ว พิมพ์ว่า "ทำเสร็จแล้วข้อ [เลข]" ได้เลยครับ)` });
   }
 
-  // ส่วนที่ 2: ระบบบันทึกข้อมูล (ลง Database)
-  if (userText.includes("จดงาน") || userText.includes("ต้องทำ") || userText.includes("งานคือ")) {
-      const cleanTask = userText.replace(/จดงานว่า|ต้องทำว่า|จดงาน|ต้องทำ|งานคือ/g, "").trim();
+  // ⚡️ [B] ระบบปิดงาน (Complete Task)
+  if (userText.includes("ทำเสร็จแล้ว") || userText.includes("ทำแล้ว") || userText.includes("เสร็จแล้ว")) {
+      const tasks = await Task.find({ userId: lineId, status: 'pending' }).sort({ createdAt: 1 });
+      let targetTask = null;
+
+      // พยายามหาเลขข้อจากข้อความ (เช่น "เสร็จแล้วข้อ 1")
+      const match = userText.match(/\d+/);
+      if (match) {
+          const index = parseInt(match[0]) - 1;
+          if (tasks[index]) targetTask = tasks[index];
+      } else if (tasks.length > 0) {
+          // ถ้าไม่ระบุเลข แต่มีงานเดียว ให้เลือกงานนั้นเลย
+          targetTask = tasks[0];
+      }
+
+      if (targetTask) {
+          targetTask.status = 'completed';
+          await targetTask.save();
+          return client.replyMessage(event.replyToken, { type: 'text', text: `ยอดเยี่ยมครับคุณ ${user.displayName}! ผมติ๊กเครื่องหมายเสร็จเรียบร้อยสำหรับงาน: "${targetTask.task}"` });
+      }
+  }
+
+  // ⚡️ [C] ระบบบันทึกงานใหม่
+  if (userText.includes("จดงาน") || userText.includes("ต้องทำ")) {
+      const cleanTask = userText.replace(/จดงานว่า|ต้องทำว่า|จดงาน|ต้องทำ/g, "").trim();
       if(cleanTask) {
           const newTask = new Task({ userId: lineId, task: cleanTask });
           await newTask.save();
       }
-  } else if (userText.includes("บันทึกว่า") || userText.includes("โน้ตว่า")) {
-      const cleanNote = userText.replace(/บันทึกว่า|โน้ตว่า/g, "").trim();
-      if(cleanNote) {
-          const newNote = new Note({ userId: lineId, content: cleanNote });
-          await newNote.save();
-      }
   }
 
-  // ส่วนที่ 3: ส่งให้ AI คิดคำตอบที่เหมาะสม
+  // 🤖 [D] ให้ AI ตอบโต้ทั่วไป
   try {
-    const systemPrompt = `คุณคือ Claw Personal OS เลขาส่วนตัวของคุณ ${user.displayName}
-    ข้อมูลความจำ: ${user.memories}
-    
-    บริบท:
-    - ถ้าผู้ใช้สั่งงาน/บันทึก คุณได้ทำการเซฟลงฐานข้อมูลแล้ว ให้ตอบรับอย่างสุภาพและยืนยันสิ่งที่จด
-    - ถ้าผู้ใช้คุยทั่วไป ให้ตอบแบบ AI เลขาที่ฉลาดและเป็นกันเอง
-    
-    ข้อความ: "${userText}"`;
+    const systemPrompt = `คุณคือ Claw Personal OS ของคุณ ${user.displayName}
+    หน้าที่: เป็นเลขาส่วนตัวที่ช่วยบันทึกและจัดการงาน
+    ข้อความจากผู้ใช้: "${userText}"`;
 
     const result = await model.generateContent(systemPrompt);
     const aiResponse = result.response.text();
 
-    user.lastChat = new Date();
-    await user.save();
-
     return client.replyMessage(event.replyToken, { type: 'text', text: aiResponse });
   } catch (error) {
-    return client.replyMessage(event.replyToken, { type: 'text', text: 'ขออภัยครับ ข้อมูลเยอะจนมึนหัว ขอลองใหม่อีกทีนะครับ' });
+    return client.replyMessage(event.replyToken, { type: 'text', text: 'มึนหัวจังครับ ขอลองใหม่อีกที' });
   }
 }
 
