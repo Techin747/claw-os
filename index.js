@@ -17,7 +17,7 @@ mongoose.connect(process.env.MONGODB_URI)
 // 2. ผังข้อมูล (Schemas)
 const UserSchema = new mongoose.Schema({
   lineId: { type: String, unique: true },
-  displayName: { type: String, default: 'เตชินท์' }, // ตั้งค่าเริ่มต้นเป็นชื่อคุณ
+  displayName: { type: String, default: 'เตชินท์' },
   memories: { type: String, default: 'เป็นเจ้าของระบบ Claw OS' }
 });
 const User = mongoose.model('User', UserSchema);
@@ -39,18 +39,17 @@ const client = new line.Client(lineConfig);
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ 
     model: "gemini-2.0-flash",
-    generationConfig: { responseMimeType: "application/json" }
+    generationConfig: { responseMimeType: "application/json" } // บังคับให้ตอบเป็น JSON เท่านั้น
 });
 
 // 🔔 ฟังก์ชันแจ้งเกิดระบบ (Startup Notification)
 async function sendStartupNotification() {
     try {
-        // ดึงข้อมูล User คนแรก (คุณเตชินท์) มาทักทาย
         const user = await User.findOne();
         if (user && user.lineId) {
             await client.pushMessage(user.lineId, {
                 type: 'text',
-                text: `🚀 Claw OS รายงานตัว! ระบบอัปเกรดเสร็จสิ้นและพร้อมรับใช้คุณ ${user.displayName} แล้วครับ มีอะไรให้ผมช่วยจัดการไหมครับ?`
+                text: `🚀 Claw OS รายงานตัว! ระบบอัปเกรดความแม่นยำเสร็จสิ้นและพร้อมรับใช้คุณ ${user.displayName} แล้วครับ`
             });
             console.log('🔔 Startup notification sent!');
         }
@@ -67,7 +66,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   } catch (error) { res.status(500).end(); }
 });
 
-// 4. สมองส่วนวิเคราะห์ภาษาธรรมชาติ
+// 4. สมองส่วนหน้า: วิเคราะห์และจัดการ (Strict Mode)
 async function handleEvent(event) {
   if (event.type !== 'message' || event.message.type !== 'text') return;
 
@@ -78,30 +77,38 @@ async function handleEvent(event) {
   if (!user) { user = new User({ lineId }); await user.save(); }
 
   try {
-    const analysisPrompt = `คุณคือ Claw OS เลขาส่วนตัวที่ฉลาดที่สุดของคุณ ${user.displayName}
-    วิเคราะห์เจตนาจากประโยค: "${userText}"
-    ตอบกลับเป็น JSON เท่านั้น:
+    // 🧠 ปรับ Prompt ให้เข้มงวด ห้ามมโน!
+    const analysisPrompt = `คุณคือ Claw OS เลขาส่วนตัวของคุณ ${user.displayName}
+    วิเคราะห์ประโยคจากผู้ใช้: "${userText}"
+    และตอบกลับเป็น JSON เท่านั้นตามรูปแบบนี้:
     {
-      "intent": "add_task" | "list_tasks" | "complete_task" | "chat",
-      "data": "สรุปเนื้อหางานสั้นๆ",
+      "intent": "add_task" หรือ "list_tasks" หรือ "complete_task" หรือ "chat",
+      "data": "ถ้า intent คือ add_task ให้สรุปเนื้อหางานสั้นๆ (ถ้าไม่ใช่ให้ใส่สตริงว่าง)",
       "taskIndex": 0,
-      "aiReply": "คำตอบที่ดูเป็นธรรมชาติและเป็นกันเอง"
+      "aiReply": "คำตอบโต้กลับแบบเป็นกันเอง"
     }
     
-    กฎ:
-    - ถ้าผู้ใช้บอกนัดหมาย/สิ่งที่ต้องทำ = add_task
-    - ถ้าถามถึงงานค้าง/รายการงาน = list_tasks
-    - ถ้าบอกว่าทำเสร็จแล้ว/ขีดฆ่าออก/ลบงาน = complete_task
-    - นอกนั้น = chat`;
+    กฎการเลือก intent (ต้องทำตามอย่างเคร่งครัด):
+    1. "add_task" = เมื่อบอกให้จด, บอกว่ามีนัด, หรือบอกสิ่งที่ต้องทำ (เช่น "มีรายงานต้องส่งวันเสาร์", "จดงานว่า...")
+    2. "list_tasks" = เมื่อถามว่ามีงานอะไรบ้าง, ขอดูงาน, งานค้าง (เช่น "มีงานค้างอะไรบ้าง", "มีงานไหม")
+    3. "complete_task" = เมื่อบอกว่าทำเสร็จแล้ว, เรียบร้อย, ลบงานข้อ...
+    4. "chat" = พูดคุยทั่วไป (คำเตือน: ห้ามตอบว่าบันทึกงานแล้วใน aiReply เด็ดขาด ถ้า intent คือ chat)`;
 
     const result = await model.generateContent(analysisPrompt);
-    const analysis = JSON.parse(result.response.text());
+    const textResponse = result.response.text();
+    
+    // พิมพ์ Log ไว้ดูเบื้องหลังในเว็บ Render
+    console.log("User:", userText);
+    console.log("AI Analysis:", textResponse); 
 
+    const analysis = JSON.parse(textResponse);
     let finalResponse = analysis.aiReply;
 
-    // ⚡️ ดำเนินการตามเจตนา (Logic Execution)
+    // ⚡️ ดำเนินการตามเจตนา (Database Execution)
     if (analysis.intent === "add_task" && analysis.data) {
         await new Task({ userId: lineId, task: analysis.data }).save();
+        // 🚨 บังคับตอบด้วยระบบเอง เพื่อยืนยันว่าเข้า Database จริงๆ
+        finalResponse = `✅ บันทึกงาน "${analysis.data}" ลงฐานข้อมูลเรียบร้อยครับ!`; 
     } 
     else if (analysis.intent === "list_tasks") {
         const tasks = await Task.find({ userId: lineId, status: 'pending' }).sort({ createdAt: 1 });
@@ -109,7 +116,7 @@ async function handleEvent(event) {
             finalResponse = `ตอนนี้ไม่มีงานค้างเลยครับคุณ ${user.displayName} พักผ่อนได้เต็มที่ครับ!`;
         } else {
             const list = tasks.map((t, i) => `📌 ${i + 1}. ${t.task}`).join('\n');
-            finalResponse = `รายการงานที่ผมบันทึกไว้ครับ:\n\n${list}\n\n${analysis.aiReply}`;
+            finalResponse = `รายการงานของคุณครับ:\n\n${list}\n\n${analysis.aiReply}`;
         }
     } 
     else if (analysis.intent === "complete_task") {
@@ -119,15 +126,20 @@ async function handleEvent(event) {
         if (target) {
             target.status = 'completed';
             await target.save();
-            finalResponse = `✅ รับทราบครับ! ผมปิดงาน "${target.task}" ให้เรียบร้อยแล้ว ยอดเยี่ยมมากครับ!`;
+            finalResponse = `✅ รับทราบครับ! ผมปิดงาน "${target.task}" ให้เรียบร้อยแล้ว`;
+        } else {
+            finalResponse = `❌ หาไม่เจอครับว่าต้องปิดงานไหน รบกวนระบุเลขข้อได้ไหมครับ?`;
         }
     }
 
     return client.replyMessage(event.replyToken, { type: 'text', text: finalResponse });
 
   } catch (error) {
-    return client.replyMessage(event.replyToken, { type: 'text', text: "ขออภัยครับคุณเตชินท์ ผมขอจัดระเบียบความคิดสักครู่ รบกวนลองใหม่อีกครั้งนะครับ" });
+    console.error("System Error:", error);
+    return client.replyMessage(event.replyToken, { type: 'text', text: "ขออภัยครับ สมองส่วนหน้าขัดข้อง รบกวนลองใหม่อีกครั้งนะครับ" });
   }
 }
 
-app.listen(port);
+app.listen(port, () => {
+  console.log(`🚀 Claw OS พร้อมทำงานที่พอร์ต ${port}`);
+});
