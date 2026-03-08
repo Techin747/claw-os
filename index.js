@@ -34,7 +34,10 @@ const lineConfig = {
 };
 const client = new line.Client(lineConfig);
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+const model = genAI.getGenerativeModel({ 
+    model: "gemini-2.0-flash",
+    generationConfig: { responseMimeType: "application/json" } // บังคับ Output เป็น JSON จากตัวโมเดลเลย
+});
 
 app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   try {
@@ -54,68 +57,60 @@ async function handleEvent(event) {
   if (!user) { user = new User({ lineId }); await user.save(); }
 
   try {
-    // 🧠 ส่วนที่สำคัญที่สุด: ให้ AI วิเคราะห์เจตนา (Intent Extraction)
-    const analysisPrompt = `คุณคือสมองส่วนกลางของ Claw OS
-    จงวิเคราะห์ประโยค: "${userText}" 
-    แล้วตอบกลับเป็นรูปแบบ JSON เท่านั้น ห้ามตอบเป็นคำบรรยาย:
+    // 🧠 วิเคราะห์เจตนาด้วย AI (Intent Analysis)
+    const analysisPrompt = `คุณคือ Claw OS เลขาส่วนตัวของคุณ ${user.displayName}
+    วิเคราะห์ประโยค: "${userText}"
+    ตอบเป็น JSON เท่านั้น:
     {
       "intent": "add_task" | "list_tasks" | "complete_task" | "chat",
-      "data": "เนื้อหางานที่ต้องการบันทึก (ถ้ามี)",
-      "taskIndex": "เลขข้อที่ต้องการปิด (ถ้ามี)",
-      "aiReply": "คำตอบที่สุภาพและเป็นกันเองในฐานะเลขา"
+      "data": "เนื้อหาสำคัญที่ต้องจด",
+      "taskIndex": 0,
+      "aiReply": "คำตอบโต้กับผู้ใช้"
     }
     
     กฎ:
-    - ถ้าผู้ใช้บอกเล่าเหตุการณ์ที่ต้องทำในอนาคต = add_task
-    - ถ้าผู้ใช้ขอดูรายการงานหรือถามว่ามีอะไรต้องทำบ้าง = list_tasks
-    - ถ้าผู้ใช้บอกว่าทำอะไรเสร็จแล้ว หรือให้ลบงาน = complete_task
+    - ถ้าเป็นสิ่งที่ต้องทำ/นัดหมายในอนาคต = add_task
+    - ถ้าถามว่ามีงานอะไร/มีอะไรต้องทำบ้าง = list_tasks
+    - ถ้าบอกว่าทำเสร็จแล้ว/เรียบร้อยแล้ว/ให้ลบออก = complete_task
     - นอกนั้น = chat`;
 
-    const analysisResult = await model.generateContent(analysisPrompt);
-    const analysis = JSON.parse(analysisResult.response.text().replace(/```json|```/g, ""));
+    const result = await model.generateContent(analysisPrompt);
+    const analysis = JSON.parse(result.response.text());
 
-    // ⚡️ Execution Logic ตามผลวิเคราะห์ของ AI
-    
-    // 1. เพิ่มงานใหม่ (Natural Language Add)
+    let finalResponse = analysis.aiReply;
+
+    // ⚡️ จัดการฐานข้อมูลตาม Intent
     if (analysis.intent === "add_task" && analysis.data) {
-        const newTask = new Task({ userId: lineId, task: analysis.data });
-        await newTask.save();
-    }
-
-    // 2. แสดงรายการงาน (Smart List)
-    if (analysis.intent === "list_tasks") {
+        await new Task({ userId: lineId, task: analysis.data }).save();
+    } 
+    else if (analysis.intent === "list_tasks") {
         const tasks = await Task.find({ userId: lineId, status: 'pending' }).sort({ createdAt: 1 });
         if (tasks.length === 0) {
-            return client.replyMessage(event.replyToken, { type: 'text', text: `คุณ ${user.displayName} ไม่มีงานค้างเลยครับ วันนี้ยอดเยี่ยมมาก!` });
+            finalResponse = `คุณ ${user.displayName} ไม่มีงานค้างเลยครับ! สบายใจได้`;
+        } else {
+            const list = tasks.map((t, i) => `📌 ${i + 1}. ${t.task}`).join('\n');
+            finalResponse = `รายการงานของคุณครับ:\n\n${list}\n\n${analysis.aiReply}`;
         }
-        const taskList = tasks.map((t, i) => `📌 ${i + 1}. ${t.task}`).join('\n');
-        return client.replyMessage(event.replyToken, { type: 'text', text: `รายการงานของคุณครับ:\n\n${taskList}\n\n${analysis.aiReply}` });
-    }
-
-    // 3. ปิดงาน (Natural Language Complete)
-    if (analysis.intent === "complete_task") {
+    } 
+    else if (analysis.intent === "complete_task") {
         const tasks = await Task.find({ userId: lineId, status: 'pending' }).sort({ createdAt: 1 });
         let target = null;
-        
-        if (analysis.taskIndex) {
-            target = tasks[parseInt(analysis.taskIndex) - 1];
-        } else {
-            // ค้นหางานที่ข้อความตรงกันที่สุด
-            target = tasks.find(t => userText.includes(t.task.substring(0, 5)));
-        }
+        if (analysis.taskIndex > 0) target = tasks[analysis.taskIndex - 1];
+        else target = tasks.find(t => userText.includes(t.task.substring(0, 4)));
 
         if (target) {
             target.status = 'completed';
             await target.save();
+            finalResponse = `✅ เรียบร้อย! ผมปิดงาน "${target.task}" ให้แล้วครับ`;
         }
     }
 
-    // 4. ตอบกลับด้วย AI
-    return client.replyMessage(event.replyToken, { type: 'text', text: analysis.aiReply });
+    return client.replyMessage(event.replyToken, { type: 'text', text: finalResponse });
 
   } catch (error) {
-    console.error(error);
-    return client.replyMessage(event.replyToken, { type: 'text', text: "ขออภัยครับ สมองส่วนหน้าของผมขัดข้องนิดหน่อย" });
+    console.error("Claw Error:", error);
+    // กรณี AI เพี้ยน ให้ตอบกลับแบบปกติไปก่อน
+    return client.replyMessage(event.replyToken, { type: 'text', text: "ขออภัยครับ ผมขอเรียบเรียงข้อมูลสักครู่ ลองพิมพ์ใหม่อีกทีนะครับ" });
   }
 }
 
