@@ -14,7 +14,7 @@ const client = new line.Client(lineConfig);
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ 
-  model: "gemini-1.5-flash",
+  model: "gemini-2.5-flash",
   systemInstruction: "คุณคือ Claw ระบบผู้ช่วยส่วนตัว คุยเล่นได้ มีความรู้สึก โกรธหรืองอนได้" 
 }); // เรื่องนิสัย เดี๋ยวเราค่อยมาอัปเดตแชท IG ใส่ตรงนี้ทีหลังครับ
 
